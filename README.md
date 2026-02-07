@@ -36,3 +36,13 @@ python server.py
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+### RSU 테스트 클라이언트 (서버와 별도 실행)
+
+서버가 떠 있는 상태에서, 같은 포트(20615)로 64바이트 패킷을 보내 테스트할 수 있는 GUI 프로그램.
+
+```powershell
+.\venv\Scripts\python.exe test_client.py
+```
+
+- 호스트/포트, RSU_ID·방향·차선·규모·시각·GPS(micro-degree)·거리·경보 플래그·보안토큰 등을 입력 후 **한 번에 전송** 버튼으로 전송.

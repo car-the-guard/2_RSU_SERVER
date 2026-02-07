@@ -63,7 +63,7 @@ def parse_rsu_packet(data: bytes) -> AccidentInfo | None:
     except struct.error:
         return None
     rsu_id_str = str(rsu_id)
-    acc_id_str = str(acc_id_raw) if acc_id_raw else f"0x{acc_id_raw:016X}"
+    acc_id_str = f"0x{acc_id_raw:016X}"
     lat_deg = lat_micro / 1_000_000.0
     lon_deg = lon_micro / 1_000_000.0
     gps_str = f"{lat_deg:.6f}° N, {lon_deg:.6f}° E"
@@ -157,6 +157,14 @@ class RSUReceiver:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# 나침반 방향 (0~360° → N, NE, E, SE, S, SW, W, NW)
+_COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def _degree_to_compass(degree: int) -> str:
+    idx = int((degree % 360 + 22.5) // 45) % 8
+    return _COMPASS[idx]
+
 
 class AccidentCard(ctk.CTkFrame):
     """한 건의 사고 정보를 보여주는 둥근 직사각형 카드."""
@@ -185,41 +193,43 @@ class AccidentCard(ctk.CTkFrame):
         self.grid_columnconfigure(1, weight=0)
 
         info_frame = ctk.CTkFrame(self, fg_color="transparent")
-        info_frame.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=12)
+        info_frame.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=(12, 12))
         info_frame.grid_columnconfigure(0, weight=1)
+        info_frame.grid_columnconfigure(1, weight=1)
 
         row = 0
-        ctk.CTkLabel(info_frame, text=f"사고 ID: {accident_id}", anchor="w", font=ctk.CTkFont(weight="bold")).grid(row=row, column=0, sticky="w")
+        label_pady = (1, 1)
+        ctk.CTkLabel(info_frame, text=f"사고 ID: {accident_id}", anchor="w", font=ctk.CTkFont(weight="bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
         row += 1
-        ctk.CTkLabel(info_frame, text=f"GPS: {gps}", anchor="w").grid(row=row, column=0, sticky="w")
+        ctk.CTkLabel(info_frame, text=f"GPS: {gps}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
         row += 1
-        ctk.CTkLabel(info_frame, text=f"발생 시각: {occurred_at}", anchor="w").grid(row=row, column=0, sticky="w")
+        ctk.CTkLabel(info_frame, text=f"발생 시각: {occurred_at}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
         row += 1
-        ctk.CTkLabel(info_frame, text=f"RSU ID: {rsu_id}", anchor="w").grid(row=row, column=0, sticky="w")
+        ctk.CTkLabel(info_frame, text=f"신고 RSU ID: {rsu_id}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
         row += 1
-        # 추가 정보 (RSU 패킷에 있을 때만)
-        if direction is not None:
-            ctk.CTkLabel(info_frame, text=f"방향: {direction}°", anchor="w").grid(row=row, column=0, sticky="w")
+        # 1행: 사고차량 주행방향(나침반) | 사고차량 주행차선 ...차선
+        if direction is not None or lane is not None:
+            if direction is not None:
+                compass = _degree_to_compass(direction)
+                ctk.CTkLabel(info_frame, text=f"사고차량 주행방향: {compass} ({direction}°)", anchor="w").grid(row=row, column=0, sticky="w", pady=label_pady)
+            if lane is not None:
+                ctk.CTkLabel(info_frame, text=f"사고차량 주행차선: {lane}차선", anchor="w").grid(row=row, column=1, sticky="w", pady=label_pady)
             row += 1
-        if lane is not None:
-            ctk.CTkLabel(info_frame, text=f"차선: {lane}", anchor="w").grid(row=row, column=0, sticky="w")
-            row += 1
-        if severity is not None:
-            ctk.CTkLabel(info_frame, text=f"규모: {severity}", anchor="w").grid(row=row, column=0, sticky="w")
-            row += 1
-        if distance is not None:
-            ctk.CTkLabel(info_frame, text=f"거리: {distance}", anchor="w").grid(row=row, column=0, sticky="w")
-            row += 1
-        if altitude is not None:
-            ctk.CTkLabel(info_frame, text=f"고도: {altitude}", anchor="w").grid(row=row, column=0, sticky="w")
+        # 2행: 사고유형(1:급정거/2:충돌사고/3:차량 차선 이탈) | RSU와의 직선거리 ...m
+        if severity is not None or distance is not None:
+            _severity_text = {1: "급정거", 2: "충돌사고", 3: "차량 차선 이탈"}.get(severity, str(severity)) if severity is not None else ""
+            if severity is not None:
+                ctk.CTkLabel(info_frame, text=f"사고유형: {_severity_text}", anchor="w").grid(row=row, column=0, sticky="w", pady=label_pady)
+            if distance is not None:
+                ctk.CTkLabel(info_frame, text=f"RSU와의 직선거리: {distance}m", anchor="w").grid(row=row, column=1, sticky="w", pady=label_pady)
             row += 1
 
         right_frame = ctk.CTkFrame(self, fg_color="transparent")
-        right_frame.grid(row=0, column=1, sticky="ns", padx=(8, 12), pady=12)
+        right_frame.grid(row=0, column=1, sticky="ns", padx=(8, 12), pady=(12, 12))
         right_frame.grid_rowconfigure(0, weight=0)
         right_frame.grid_rowconfigure(1, weight=0)
 
-        status_text = "경보 ON" if alarm_on is True else ("경보 OFF" if alarm_on is False else "경보 중")
+        status_text = "경보 ON" if alarm_on is True else ("경보 OFF" if alarm_on is False else "경보 중")  # 기본: 경보 중
         status_color = ("coral", "coral") if alarm_on is not False else ("gray50", "gray50")
         self.status_label = ctk.CTkLabel(right_frame, text=status_text, text_color=status_color)
         self.status_label.grid(row=0, column=0, pady=(0, 8))
@@ -328,11 +338,17 @@ class MainApp(ctk.CTk):
 
     def _add_sample_accident(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        n = len(self._card_wrappers)
         self.add_accident(
-            accident_id=f"A-{datetime.now().strftime('%H%M%S')}-{len(self._card_wrappers)}",
-            gps="37.5665° N, 126.9780° E",
+            accident_id=f"0x{n + 1:016X}",
+            gps="37.566500° N, 126.978000° E",
             occurred_at=now,
-            rsu_id=f"RSU-{1000 + len(self._card_wrappers)}",
+            rsu_id=f"0x{0x1001 + n:X}",
+            direction=90,
+            lane=1,
+            severity=2,
+            distance=100,
+            alarm_on=None,
         )
 
     def add_accident(
@@ -349,11 +365,9 @@ class MainApp(ctk.CTk):
         altitude: int | None = None,
         alarm_on: bool | None = None,
     ):
-        """사고 정보 한 건을 목록 위쪽에 추가. RSU 패킷 추가 필드는 키워드 인자로."""
-        has_extras = any(x is not None for x in (direction, lane, severity, distance, altitude))
-        CARD_ROW_HEIGHT = 150 if has_extras else 108
-        wrapper = ctk.CTkFrame(self.accident_container, fg_color="transparent", height=CARD_ROW_HEIGHT)
-        wrapper.grid_propagate(False)
+        """사고 정보 한 건을 목록 위쪽에 추가. RSU 패킷 추가 필드는 키워드 인자로. 컨텐츠에 따라 카드 높이가 반응형으로 늘어남."""
+        wrapper = ctk.CTkFrame(self.accident_container, fg_color="transparent")
+        wrapper.grid_propagate(True)
         wrapper.grid_columnconfigure(0, weight=1)
         wrapper.grid_rowconfigure(0, weight=0)
 
@@ -369,15 +383,12 @@ class MainApp(ctk.CTk):
             distance=distance,
             altitude=altitude,
             alarm_on=alarm_on,
-            height=132 if has_extras else 92,
         )
-        card.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        card.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         card.set_clear_callback(self._on_card_clear)
 
         self._card_wrappers.append(wrapper)
-        # 스크롤 영역에서 위쪽에 붙이기: 새 위젯을 row=0에 넣고 기존 것들을 아래로 밀기
-        # 대신 단순히 append하고 grid(row=len-1) 하면 자연스럽게 위에서 아래로 쌓임
-        wrapper.grid(row=len(self._card_wrappers) - 1, column=0, sticky="ew", pady=(0, 0))
+        wrapper.grid(row=len(self._card_wrappers) - 1, column=0, sticky="ew", padx=(0, 4), pady=(6, 8))
 
     def _on_card_clear(self, card: AccidentCard):
         """카드 해제 시 래퍼를 애니메이션하고 제거."""
@@ -392,9 +403,12 @@ class MainApp(ctk.CTk):
 
     def _animate_and_remove_wrapper(self, wrapper: ctk.CTkFrame):
         """래퍼 높이를 0으로 줄인 뒤 제거하고, 이후 row 인덱스 재정렬."""
-        start_h = wrapper.cget("height") or wrapper.winfo_height()
+        self.update_idletasks()
+        start_h = wrapper.winfo_height()
         if start_h <= 0:
-            start_h = 108
+            start_h = 100
+        wrapper.grid_propagate(False)
+        wrapper.configure(height=start_h)
         step = max(4, start_h // 8)
         delay_ms = 15
 
@@ -412,7 +426,7 @@ class MainApp(ctk.CTk):
         """남은 카드들의 grid row를 다시 0,1,2,... 로 정렬."""
         for i, w in enumerate(self._card_wrappers):
             if w.winfo_exists():
-                w.grid(row=i, column=0, sticky="ew", pady=(0, 0))
+                w.grid(row=i, column=0, sticky="ew", padx=(0, 4), pady=(6, 8))
 
 
 def main():
