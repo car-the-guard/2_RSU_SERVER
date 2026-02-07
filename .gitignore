@@ -1,0 +1,34 @@
+# 가상환경 (의존성은 requirements.txt로 관리)
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 환경 변수/비밀 (API 키 등)
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE (필요 시 .vscode/ 는 제거하고 공유해도 됨)
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cursor 프로젝트 로컬 설정 (선택)
+# .cursor/
