@@ -3,45 +3,235 @@ RSU 사고 정보 관리 GUI
 - 왼쪽 2/3: 사고 정보 카드 목록 (세로 스크롤, 위쪽 정렬)
 - 오른쪽 1/3: 메뉴/조작 영역
 - 사고 카드: 둥근 직사각형, 해제 시 애니메이션으로 제거
+- 포트 20615 TCP로 RSU 패킷 수신 및 파싱
 """
 
 import customtkinter as ctk
+import socket
+import struct
+import threading
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
+
+# 수신 대기 포트
+RSU_PORT = 20615
+
+# 패킷 레이아웃 (빅엔디안, 총 64바이트)
+# RSU_ID 4B, Direction 2B, Lane 1B, Severity 1B,
+# Accident Time 8B, Accident ID 8B, Lat 4B, Lon 4B, Alt 4B,
+# distance 2B, Accident Flag 2B, RSU RX Time 8B, 보안토큰 16B
+PACKET_FORMAT = "> I H B B Q Q i i i H H Q 16s"
+PACKET_SIZE = struct.calcsize(PACKET_FORMAT)  # 64
+
+
+@dataclass
+class AccidentInfo:
+    """파싱된 사고 정보 (카드 표시용)."""
+    accident_id: str
+    gps: str
+    occurred_at: str
+    rsu_id: str
+    direction: int | None = None   # 0~360°
+    lane: int | None = None       # 차선
+    severity: int | None = None    # 규모
+    distance: int | None = None   # RSU~사고 거리
+    altitude: int | None = None   # 고도 (micro-degree 또는 단위 미정)
+    alarm_on: bool | None = None  # True=경보 ON(0x0000), False=OFF(0xFFFF)
+
+
+def parse_rsu_packet(data: bytes) -> AccidentInfo | None:
+    """RSU 사고 패킷 64바이트 파싱. Returns AccidentInfo or None if invalid."""
+    if len(data) != PACKET_SIZE:
+        return None
+    try:
+        (
+            rsu_id,
+            direction,
+            lane,
+            severity,
+            acc_time_raw,
+            acc_id_raw,
+            lat_micro,
+            lon_micro,
+            alt_micro,
+            distance,
+            acc_flag,
+            _rsu_rx_time,
+            _token,
+        ) = struct.unpack(PACKET_FORMAT, data)
+    except struct.error:
+        return None
+    rsu_id_str = str(rsu_id)
+    acc_id_str = f"0x{acc_id_raw:016X}"
+    lat_deg = lat_micro / 1_000_000.0
+    lon_deg = lon_micro / 1_000_000.0
+    gps_str = f"{lat_deg:.6f}° N, {lon_deg:.6f}° E"
+    try:
+        if acc_time_raw > 1e12:
+            acc_time_sec = acc_time_raw / 1000.0
+        else:
+            acc_time_sec = float(acc_time_raw)
+        occurred_at = datetime.utcfromtimestamp(acc_time_sec).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, ValueError):
+        occurred_at = str(acc_time_raw)
+    alarm_on = acc_flag == 0x0000 if acc_flag in (0x0000, 0xFFFF) else None
+    return AccidentInfo(
+        accident_id=acc_id_str,
+        gps=gps_str,
+        occurred_at=occurred_at,
+        rsu_id=rsu_id_str,
+        direction=int(direction),
+        lane=int(lane),
+        severity=int(severity),
+        distance=int(distance),
+        altitude=int(alt_micro),
+        alarm_on=alarm_on,
+    )
+
+
+class RSUReceiver:
+    """포트 20615에서 TCP로 RSU 패킷 수신, 파싱 후 콜백 호출."""
+
+    def __init__(self, port: int, on_accident: Callable[[AccidentInfo], None]):
+        self.port = port
+        self.on_accident = on_accident
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> bool:
+        if self._thread and self._thread.is_alive():
+            return False
+        self._stop.clear()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._sock.bind(("", self.port))
+            self._sock.listen(5)
+            self._sock.settimeout(1.0)
+        except OSError:
+            self._sock.close()
+            self._sock = None
+            return False
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _accept_loop(self):
+        while not self._stop.is_set() and self._sock:
+            try:
+                conn, _ = self._sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            try:
+                with conn:
+                    buf = b""
+                    while not self._stop.is_set():
+                        data = conn.recv(4096)
+                        if not data:
+                            break
+                        buf += data
+                        while len(buf) >= PACKET_SIZE:
+                            packet, buf = buf[:PACKET_SIZE], buf[PACKET_SIZE:]
+                            parsed = parse_rsu_packet(packet)
+                            if parsed:
+                                self.on_accident(parsed)
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                pass
+
 
 # 테마 설정 (선택)
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+# 나침반 방향 (0~360° → N, NE, E, SE, S, SW, W, NW)
+_COMPASS = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def _degree_to_compass(degree: int) -> str:
+    idx = int((degree % 360 + 22.5) // 45) % 8
+    return _COMPASS[idx]
+
 
 class AccidentCard(ctk.CTkFrame):
     """한 건의 사고 정보를 보여주는 둥근 직사각형 카드."""
 
-    def __init__(self, master, accident_id: str, gps: str, occurred_at: str, rsu_id: str, **kwargs):
+    def __init__(
+        self,
+        master,
+        accident_id: str,
+        gps: str,
+        occurred_at: str,
+        rsu_id: str,
+        *,
+        direction: int | None = None,
+        lane: int | None = None,
+        severity: int | None = None,
+        distance: int | None = None,
+        altitude: int | None = None,
+        alarm_on: bool | None = None,
+        **kwargs,
+    ):
         super().__init__(master, corner_radius=12, fg_color=("gray85", "gray20"), **kwargs)
         self.accident_id = accident_id
-        self.on_clear_callback = None  # 해제 시 호출할 콜백
+        self.on_clear_callback = None
 
-        # 카드 내부: 왼쪽 정보 영역 + 오른쪽 상태/버튼
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=0)
 
-        # 왼쪽: 사고 정보 (세로 배치)
         info_frame = ctk.CTkFrame(self, fg_color="transparent")
-        info_frame.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=12)
+        info_frame.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=(12, 12))
         info_frame.grid_columnconfigure(0, weight=1)
+        info_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(info_frame, text=f"사고 ID: {accident_id}", anchor="w", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(info_frame, text=f"GPS: {gps}", anchor="w").grid(row=1, column=0, sticky="w")
-        ctk.CTkLabel(info_frame, text=f"발생 시각: {occurred_at}", anchor="w").grid(row=2, column=0, sticky="w")
-        ctk.CTkLabel(info_frame, text=f"RSU ID: {rsu_id}", anchor="w").grid(row=3, column=0, sticky="w")
+        row = 0
+        label_pady = (1, 1)
+        ctk.CTkLabel(info_frame, text=f"사고 ID: {accident_id}", anchor="w", font=ctk.CTkFont(weight="bold")).grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
+        row += 1
+        ctk.CTkLabel(info_frame, text=f"GPS: {gps}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
+        row += 1
+        ctk.CTkLabel(info_frame, text=f"발생 시각: {occurred_at}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
+        row += 1
+        ctk.CTkLabel(info_frame, text=f"신고 RSU ID: {rsu_id}", anchor="w").grid(row=row, column=0, columnspan=2, sticky="w", pady=label_pady)
+        row += 1
+        # 1행: 사고차량 주행방향(나침반) | 사고차량 주행차선 ...차선
+        if direction is not None or lane is not None:
+            if direction is not None:
+                compass = _degree_to_compass(direction)
+                ctk.CTkLabel(info_frame, text=f"사고차량 주행방향: {compass} ({direction}°)", anchor="w").grid(row=row, column=0, sticky="w", pady=label_pady)
+            if lane is not None:
+                ctk.CTkLabel(info_frame, text=f"사고차량 주행차선: {lane}차선", anchor="w").grid(row=row, column=1, sticky="w", pady=label_pady)
+            row += 1
+        # 2행: 사고유형(1:급정거/2:충돌사고/3:차량 차선 이탈) | RSU와의 직선거리 ...m
+        if severity is not None or distance is not None:
+            _severity_text = {1: "급정거", 2: "충돌사고", 3: "차량 차선 이탈"}.get(severity, str(severity)) if severity is not None else ""
+            if severity is not None:
+                ctk.CTkLabel(info_frame, text=f"사고유형: {_severity_text}", anchor="w").grid(row=row, column=0, sticky="w", pady=label_pady)
+            if distance is not None:
+                ctk.CTkLabel(info_frame, text=f"RSU와의 직선거리: {distance}m", anchor="w").grid(row=row, column=1, sticky="w", pady=label_pady)
+            row += 1
 
-        # 오른쪽: 상태 텍스트 + 해제 버튼 (세로)
         right_frame = ctk.CTkFrame(self, fg_color="transparent")
-        right_frame.grid(row=0, column=1, sticky="ns", padx=(8, 12), pady=12)
+        right_frame.grid(row=0, column=1, sticky="ns", padx=(8, 12), pady=(12, 12))
         right_frame.grid_rowconfigure(0, weight=0)
         right_frame.grid_rowconfigure(1, weight=0)
 
-        self.status_label = ctk.CTkLabel(right_frame, text="경보 중", text_color=("coral", "coral"))
+        status_text = "경보 ON" if alarm_on is True else ("경보 OFF" if alarm_on is False else "경보 중")  # 기본: 경보 중
+        status_color = ("coral", "coral") if alarm_on is not False else ("gray50", "gray50")
+        self.status_label = ctk.CTkLabel(right_frame, text=status_text, text_color=status_color)
         self.status_label.grid(row=0, column=0, pady=(0, 8))
 
         self.clear_btn = ctk.CTkButton(
@@ -114,27 +304,70 @@ class MainApp(ctk.CTk):
         menu_inner.grid_columnconfigure(0, weight=1)
 
         ctk.CTkButton(menu_inner, text="샘플 사고 추가", command=self._add_sample_accident, height=36).grid(row=0, column=0, pady=6, sticky="ew")
-        ctk.CTkLabel(menu_inner, text="(RSU 연동 시 여기서 수신)", text_color="gray").grid(row=1, column=0, pady=4)
+
+        self._server_status = ctk.CTkLabel(menu_inner, text="", text_color="gray")
+        self._server_status.grid(row=1, column=0, pady=8, sticky="w")
+        self._receiver: RSUReceiver | None = None
+        self._start_rsu_server()
 
         # 샘플 데이터 몇 개로 시작
         self._add_sample_accident()
         self._add_sample_accident()
 
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _on_rsu_accident(self, info: AccidentInfo):
+        """RSU 스레드에서 호출 → 메인 스레드에서 카드 추가."""
+        self.after(0, lambda: self.add_accident(
+            info.accident_id, info.gps, info.occurred_at, info.rsu_id,
+            direction=info.direction, lane=info.lane, severity=info.severity,
+            distance=info.distance, altitude=info.altitude, alarm_on=info.alarm_on,
+        ))
+
+    def _start_rsu_server(self):
+        self._receiver = RSUReceiver(RSU_PORT, self._on_rsu_accident)
+        if self._receiver.start():
+            self._server_status.configure(text=f"수신 대기 중 0.0.0.0:{RSU_PORT}", text_color=("green", "lime"))
+        else:
+            self._server_status.configure(text=f"포트 {RSU_PORT} 열기 실패", text_color=("red", "salmon"))
+
+    def _on_closing(self):
+        if self._receiver:
+            self._receiver.stop()
+        self.destroy()
+
     def _add_sample_accident(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        n = len(self._card_wrappers)
         self.add_accident(
-            accident_id=f"A-{datetime.now().strftime('%H%M%S')}-{len(self._card_wrappers)}",
-            gps="37.5665° N, 126.9780° E",
+            accident_id=f"0x{n + 1:016X}",
+            gps="37.566500° N, 126.978000° E",
             occurred_at=now,
-            rsu_id=f"RSU-{1000 + len(self._card_wrappers)}",
+            rsu_id=f"0x{0x1001 + n:X}",
+            direction=90,
+            lane=1,
+            severity=2,
+            distance=100,
+            alarm_on=None,
         )
 
-    def add_accident(self, accident_id: str, gps: str, occurred_at: str, rsu_id: str):
-        """사고 정보 한 건을 목록 위쪽에 추가."""
-        # 애니메이션 시 높이를 줄일 래퍼 사용 (높이 고정으로 애니메이션 안정화)
-        CARD_ROW_HEIGHT = 108
-        wrapper = ctk.CTkFrame(self.accident_container, fg_color="transparent", height=CARD_ROW_HEIGHT)
-        wrapper.grid_propagate(False)
+    def add_accident(
+        self,
+        accident_id: str,
+        gps: str,
+        occurred_at: str,
+        rsu_id: str,
+        *,
+        direction: int | None = None,
+        lane: int | None = None,
+        severity: int | None = None,
+        distance: int | None = None,
+        altitude: int | None = None,
+        alarm_on: bool | None = None,
+    ):
+        """사고 정보 한 건을 목록 위쪽에 추가. RSU 패킷 추가 필드는 키워드 인자로. 컨텐츠에 따라 카드 높이가 반응형으로 늘어남."""
+        wrapper = ctk.CTkFrame(self.accident_container, fg_color="transparent")
+        wrapper.grid_propagate(True)
         wrapper.grid_columnconfigure(0, weight=1)
         wrapper.grid_rowconfigure(0, weight=0)
 
@@ -144,15 +377,18 @@ class MainApp(ctk.CTk):
             gps=gps,
             occurred_at=occurred_at,
             rsu_id=rsu_id,
-            height=92,
+            direction=direction,
+            lane=lane,
+            severity=severity,
+            distance=distance,
+            altitude=altitude,
+            alarm_on=alarm_on,
         )
-        card.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        card.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
         card.set_clear_callback(self._on_card_clear)
 
         self._card_wrappers.append(wrapper)
-        # 스크롤 영역에서 위쪽에 붙이기: 새 위젯을 row=0에 넣고 기존 것들을 아래로 밀기
-        # 대신 단순히 append하고 grid(row=len-1) 하면 자연스럽게 위에서 아래로 쌓임
-        wrapper.grid(row=len(self._card_wrappers) - 1, column=0, sticky="ew", pady=(0, 0))
+        wrapper.grid(row=len(self._card_wrappers) - 1, column=0, sticky="ew", padx=(0, 4), pady=(6, 8))
 
     def _on_card_clear(self, card: AccidentCard):
         """카드 해제 시 래퍼를 애니메이션하고 제거."""
@@ -167,9 +403,12 @@ class MainApp(ctk.CTk):
 
     def _animate_and_remove_wrapper(self, wrapper: ctk.CTkFrame):
         """래퍼 높이를 0으로 줄인 뒤 제거하고, 이후 row 인덱스 재정렬."""
-        start_h = wrapper.cget("height") or wrapper.winfo_height()
+        self.update_idletasks()
+        start_h = wrapper.winfo_height()
         if start_h <= 0:
-            start_h = 108
+            start_h = 100
+        wrapper.grid_propagate(False)
+        wrapper.configure(height=start_h)
         step = max(4, start_h // 8)
         delay_ms = 15
 
@@ -187,7 +426,7 @@ class MainApp(ctk.CTk):
         """남은 카드들의 grid row를 다시 0,1,2,... 로 정렬."""
         for i, w in enumerate(self._card_wrappers):
             if w.winfo_exists():
-                w.grid(row=i, column=0, sticky="ew", pady=(0, 0))
+                w.grid(row=i, column=0, sticky="ew", padx=(0, 4), pady=(6, 8))
 
 
 def main():
