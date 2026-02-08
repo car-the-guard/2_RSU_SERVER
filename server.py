@@ -1,11 +1,3 @@
-"""
-RSU 사고 정보 관리 GUI
-- 왼쪽 2/3: 사고 정보 카드 목록 (세로 스크롤, 위쪽 정렬)
-- 오른쪽 1/3: 메뉴/조작 영역
-- 사고 카드: 둥근 직사각형, 해제 시 애니메이션으로 제거
-- 포트 20615 TCP로 RSU 패킷 수신 및 파싱
-"""
-
 import customtkinter as ctk
 import socket
 import struct
@@ -18,16 +10,18 @@ from typing import Callable
 RSU_PORT = 20615
 
 # 패킷 레이아웃 (빅엔디안, 총 64바이트)
+# 대문자 : unsigned, 소문자: signed 또는 문자열
+#  I : int32, H(Halfword) : int16, B(Byte인 듯) : int8, Q(Quadword) : int64, s : 문자열
+# 구성
 # RSU_ID 4B, Direction 2B, Lane 1B, Severity 1B,
 # Accident Time 8B, Accident ID 8B, Lat 4B, Lon 4B, Alt 4B,
 # distance 2B, Accident Flag 2B, RSU RX Time 8B, 보안토큰 16B
 PACKET_FORMAT = "> I H B B Q Q i i i H H Q 16s"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)  # 64
 
-
+# 사고정보의 파싱
 @dataclass
 class AccidentInfo:
-    """파싱된 사고 정보 (카드 표시용)."""
     accident_id: str
     gps: str
     occurred_at: str
@@ -68,14 +62,19 @@ def parse_rsu_packet(data: bytes) -> AccidentInfo | None:
     lon_deg = lon_micro / 1_000_000.0
     gps_str = f"{lat_deg:.6f}° N, {lon_deg:.6f}° E"
     try:
+        # 만약 이게 10^12 이상이라면 밀리초 단위라고 생각하고 나누기
         if acc_time_raw > 1e12:
             acc_time_sec = acc_time_raw / 1000.0
+        # 아니라면 초 단위라고 생각하고 그대로 사용
         else:
             acc_time_sec = float(acc_time_raw)
         occurred_at = datetime.utcfromtimestamp(acc_time_sec).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, ValueError):
+        # 단위 변환에 실패한 경우에는 그냥 그대로 두기
         occurred_at = str(acc_time_raw)
+    
     alarm_on = acc_flag == 0x0000 if acc_flag in (0x0000, 0xFFFF) else None
+    
     return AccidentInfo(
         accident_id=acc_id_str,
         gps=gps_str,
@@ -90,12 +89,34 @@ def parse_rsu_packet(data: bytes) -> AccidentInfo | None:
     )
 
 
-class RSUReceiver:
-    """포트 20615에서 TCP로 RSU 패킷 수신, 파싱 후 콜백 호출."""
+class SecurityLayer:
+    """수신 패킷에 대한 보안 검사 레이어. 통과 시에만 파싱 후 다음 콜백 호출."""
 
-    def __init__(self, port: int, on_accident: Callable[[AccidentInfo], None]):
-        self.port = port
+    def __init__(self, on_accident: Callable[[AccidentInfo], None]):
         self.on_accident = on_accident
+
+    def _verify(self, data: bytes) -> bool:
+        """보안 검사. True면 통과, False면 폐기. 이후 보안 정책에 맞춰 구현."""
+        # TODO: 토큰 검증, 서명 검증, RSU 화이트리스트 등
+        return True
+
+    def process(self, data: bytes) -> None:
+        """패킷(bytes) 수신 시 호출. 검사 통과 시에만 파싱하여 on_accident 호출."""
+        if len(data) != PACKET_SIZE:
+            return
+        if not self._verify(data):
+            return
+        parsed = parse_rsu_packet(data)
+        if parsed:
+            self.on_accident(parsed)
+
+
+class RSUReceiver:
+    """포트 20615에서 TCP로 RSU 패킷 수신 후, 바이트를 콜백에 전달."""
+
+    def __init__(self, port: int, on_packet: Callable[[bytes], None]):
+        self.port = port
+        self.on_packet = on_packet
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -146,9 +167,7 @@ class RSUReceiver:
                         buf += data
                         while len(buf) >= PACKET_SIZE:
                             packet, buf = buf[:PACKET_SIZE], buf[PACKET_SIZE:]
-                            parsed = parse_rsu_packet(packet)
-                            if parsed:
-                                self.on_accident(parsed)
+                            self.on_packet(packet)
             except (ConnectionResetError, BrokenPipeError, OSError):
                 pass
 
@@ -325,7 +344,8 @@ class MainApp(ctk.CTk):
         ))
 
     def _start_rsu_server(self):
-        self._receiver = RSUReceiver(RSU_PORT, self._on_rsu_accident)
+        security = SecurityLayer(self._on_rsu_accident)
+        self._receiver = RSUReceiver(RSU_PORT, security.process)
         if self._receiver.start():
             self._server_status.configure(text=f"수신 대기 중 0.0.0.0:{RSU_PORT}", text_color=("green", "lime"))
         else:
