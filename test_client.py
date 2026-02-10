@@ -1,22 +1,26 @@
 """
 RSU 사고 메시지 테스트 클라이언트 (GUI)
 - 서버와 별도 실행
-- 포트 20615로 64바이트 패킷 전송
-- 입력 필드로 값 설정 후 하단 버튼으로 한 번에 전송
+- 포트 20615로 64바이트 패킷 전송 후, 같은 연결에서 서버의 경보 ON 응답(64바이트) 수신
+- 포트 20905에서 TCP 수신 대기 → 서버가 사고조치완료 시 경보 OFF 패킷 수신
 """
 
 import customtkinter as ctk
 import socket
 import struct
+import threading
 import time
 from typing import Any
 
 # 서버와 동일한 패킷 형식 (빅엔디안, 64바이트)
 PACKET_FORMAT = "> I H B B Q Q i i i H H Q 16s"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+ACCIDENT_FLAG_OFFSET = 38  # Accident flag 2B 오프셋
 
+# 서버 접속용 / 경보 OFF 수신 대기 포트 (서버가 이 포트로 접속해 경보 OFF 전송)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 20615
+RSU_ALARM_LISTEN_PORT = 20905
 
 
 def build_packet(
@@ -141,6 +145,68 @@ class TestClientApp(ctk.CTk):
         self.result_label = ctk.CTkLabel(btn_frame, text="", text_color="gray")
         self.result_label.grid(row=1, column=0, sticky="w", pady=(8, 0))
 
+        # 경보 OFF 수신 대기 (서버가 20905로 접속해 경보 OFF 전송)
+        self._alarm_sock: socket.socket | None = None
+        self._alarm_stop = threading.Event()
+        self._alarm_status = ctk.CTkLabel(btn_frame, text=f"경보 OFF 수신 대기: 0.0.0.0:{RSU_ALARM_LISTEN_PORT}", text_color="gray")
+        self._alarm_status.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self._start_alarm_listener()
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+    def _start_alarm_listener(self):
+        """포트 20905에서 서버의 경보 OFF 패킷 수신 대기 (백그라운드 스레드)."""
+        def run():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("", RSU_ALARM_LISTEN_PORT))
+                sock.listen(5)
+                sock.settimeout(1.0)
+                self._alarm_sock = sock
+                while not self._alarm_stop.is_set() and sock.fileno() != -1:
+                    try:
+                        conn, addr = sock.accept()
+                    except (socket.timeout, OSError):
+                        continue
+                    try:
+                        with conn:
+                            data = conn.recv(PACKET_SIZE)
+                            if len(data) == PACKET_SIZE:
+                                acc_flag = struct.unpack_from(">H", data, ACCIDENT_FLAG_OFFSET)[0]
+                                msg = "경보 OFF" if acc_flag == 0xFFFF else "경보 ON"
+                                self.after(0, lambda m=msg, a=addr: self._on_alarm_received(m, a))
+                    except (ConnectionResetError, BrokenPipeError, OSError):
+                        pass
+            except OSError:
+                pass
+            finally:
+                if self._alarm_sock:
+                    try:
+                        self._alarm_sock.close()
+                    except OSError:
+                        pass
+                    self._alarm_sock = None
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+
+    def _on_alarm_received(self, msg: str, addr: tuple):
+        """경보 OFF(또는 ON) 수신 시 GUI 업데이트."""
+        self._alarm_status.configure(
+            text=f"마지막 수신: {msg} (from {addr[0]}:{addr[1]})",
+            text_color=("green", "lime"),
+        )
+
+    def _on_closing(self):
+        self._alarm_stop.set()
+        if self._alarm_sock:
+            try:
+                self._alarm_sock.close()
+            except OSError:
+                pass
+            self._alarm_sock = None
+        self.destroy()
+
     def _get(self, key: str, default: Any = 0) -> str:
         e = self.entries.get(key)
         return (e.get() or "").strip() if e else str(default)
@@ -199,7 +265,18 @@ class TestClientApp(ctk.CTk):
                 sock.settimeout(5.0)
                 sock.connect((host, port))
                 sock.sendall(packet)
-            self.result_label.configure(text=f"전송 완료: {host}:{port} ({PACKET_SIZE} bytes)", text_color=("green", "lime"))
+                # 같은 연결에서 서버의 경보 ON 응답(64바이트) 수신
+                reply = sock.recv(PACKET_SIZE)
+            if len(reply) == PACKET_SIZE:
+                self.result_label.configure(
+                    text=f"전송 완료 + 경보 ON 응답 수신: {host}:{port} ({PACKET_SIZE} bytes)",
+                    text_color=("green", "lime"),
+                )
+            else:
+                self.result_label.configure(
+                    text=f"전송 완료 (응답 {len(reply)} bytes, 64 예상)",
+                    text_color=("orange", "orange"),
+                )
         except (socket.error, OSError) as e:
             self.result_label.configure(text=f"전송 실패: {e}", text_color=("red", "salmon"))
 
